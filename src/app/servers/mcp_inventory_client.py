@@ -4,6 +4,7 @@ with a persistent connection that is reused across tool calls.
 """
 import asyncio
 import logging
+import os
 import sys
 from typing import Any, Dict, List, Optional
 from pathlib import Path
@@ -38,6 +39,7 @@ class MCPShopperToolsClient:
         server_params = StdioServerParameters(
             command=sys.executable,
             args=[_SERVER_SCRIPT],
+            env=dict(os.environ),
         )
 
         read, write = await self._exit_stack.enter_async_context(
@@ -61,6 +63,14 @@ class MCPShopperToolsClient:
         """Ensure the client is connected and return the session."""
         if self._session is None:
             await self.connect()
+        else:
+            # Verify connection is still alive by pinging the server
+            try:
+                await asyncio.wait_for(self._session.list_tools(), timeout=5.0)
+            except Exception:
+                logger.warning("MCP connection stale, reconnecting...")
+                await self.close()
+                await self.connect()
         return self._session
 
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any], timeout: float = 60.0) -> Any:
@@ -76,16 +86,25 @@ class MCPShopperToolsClient:
             The result from the tool call
         """
         import time as _time
-        session = await self._ensure_connected()
-        logger.info(f"Calling tool '{tool_name}' with arguments: {arguments}")
+        for attempt in range(2):
+            session = await self._ensure_connected()
+            logger.info(f"Calling tool '{tool_name}' with arguments: {arguments}")
 
-        start = _time.perf_counter()
-        result_data = await asyncio.wait_for(
-            session.call_tool(tool_name, arguments=arguments),
-            timeout=timeout,
-        )
-        elapsed = _time.perf_counter() - start
-        logger.info(f"[MCP] {tool_name} completed in {elapsed:.3f}s")
+            try:
+                start = _time.perf_counter()
+                result_data = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments=arguments),
+                    timeout=timeout,
+                )
+                elapsed = _time.perf_counter() - start
+                logger.info(f"[MCP] {tool_name} completed in {elapsed:.3f}s")
+                break
+            except Exception as e:
+                if attempt == 0:
+                    logger.warning(f"MCP call failed, reconnecting and retrying: {e}")
+                    await self.close()
+                    continue
+                raise
 
         if result_data.content and len(result_data.content) > 0:
             result = result_data.content[0].text
